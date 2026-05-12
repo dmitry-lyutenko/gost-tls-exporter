@@ -41,10 +41,11 @@ type TBSCertificate struct {
 	// Остальные поля (extensions) игнорируем для скорости
 }
 
-func Connect(ctx context.Context, target string, port string) (*x509.Certificate, error) {
+func Connect(ctx context.Context, host string, port string) (*x509.Certificate, error) {
+	target := host + ":" + port
 
 	// 1. Формируем тело ClientHello
-	handshakeBody := makeClientHello(target)
+	handshakeBody := makeClientHello(host)
 
 	// 2. Оборачиваем в TLS Record Header
 	record := make([]byte, 5)
@@ -56,11 +57,10 @@ func Connect(ctx context.Context, target string, port string) (*x509.Certificate
 	fullPacket := append(record, handshakeBody...)
 
 	// 3. Отправляем в сокет
-	// conn, err := net.DialTimeout("tcp", target+":"+port, 5*time.Second)
 	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", target+":"+port)
+	conn, err := dialer.DialContext(ctx, "tcp", target)
 	if err != nil {
-		return nil, fmt.Errorf("Ошибка подключения: %v\n", err)
+		return nil, fmt.Errorf("dial failed for %s: %w", target, err)
 	}
 	defer conn.Close()
 
@@ -69,13 +69,16 @@ func Connect(ctx context.Context, target string, port string) (*x509.Certificate
 	}
 
 	slog.Debug("sending ClientHello", "target", target, "size", len(fullPacket))
-	conn.Write(fullPacket)
+	_, err = conn.Write(fullPacket)
+	if err != nil {
+		return nil, fmt.Errorf("failed to write ClientHello to %s: %w", target, err)
+	}
 
 	var fullResponse []byte
 	for {
 		record, err := readFullRecord(ctx, conn)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to read TLS record from %s: %w", target, err)
 		}
 		fullResponse = append(fullResponse, record...)
 
@@ -93,7 +96,7 @@ func Connect(ctx context.Context, target string, port string) (*x509.Certificate
 
 		// Предохранитель, чтобы не зависнуть вечно
 		if len(fullResponse) > 32768 {
-			return nil, fmt.Errorf("response too long")
+			return nil, fmt.Errorf("response too long for %s: exceeds 32KB limit", target)
 		}
 	}
 
@@ -104,11 +107,11 @@ func Connect(ctx context.Context, target string, port string) (*x509.Certificate
 	if res[0] == 0x16 {
 		slog.Debug("server accepted ClientHello", "target", target)
 	} else if res[0] == 0x15 {
-		return nil, fmt.Errorf("server returned TLS Alert")
+		return nil, fmt.Errorf("server returned TLS Alert for %s", target)
 	}
 	o, s, err := findCertificateOffset(res)
 	if err != nil {
-		return nil, fmt.Errorf("certificate not found")
+		return nil, fmt.Errorf("certificate not found in handshake for %s: %w", target, err)
 	}
 	slog.Debug("certificate found", "target", target, "offset", o, "size", s)
 
@@ -116,20 +119,26 @@ func Connect(ctx context.Context, target string, port string) (*x509.Certificate
 	certData := res[o+4:]
 	// Внутри сообщения Certificate сначала идет 3 байта - суммарная длина цепочки.
 	// А за ней еще 3 байта - длина ПЕРВОГО сертификата.
+	if len(certData) < 6 {
+		return nil, fmt.Errorf("malformed certificate message for %s", target)
+	}
+	// Внутри сообщения Certificate:
+	// [0:3] - суммарная длина цепочки
+	// [3:6] - длина ПЕРВОГО сертификата
+	// [6:]  - сам DER первого сертификата
 	firstCertLen := int(certData[3])<<16 | int(certData[4])<<8 | int(certData[5])
-	// Вот теперь у нас есть чистый DER первого сертификата
+
+	// Safety Check: Проверяем, что указанная длина сертификата не выходит за границы полученных данных
+	if len(certData) < 6+firstCertLen {
+		return nil, fmt.Errorf("certificate length mismatch for %s: expected %d, got %d", target, firstCertLen, len(certData)-6)
+	}
+
 	firstCertDER := certData[6 : 6+firstCertLen]
 	slog.Debug("certificate DER parsed", "target", target, "size", len(firstCertDER))
 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("context canceled before parsing: %w", err)
 	}
-
-	// Вызываем парсер, который мы обсуждали ранее
-	// tbs, err := parseGostCertificate(firstCertDER)
-	// if err != nil {
-	// 	fmt.Printf("Ошибка: %s", err)
-	// }
 
 	cert, err := x509.ParseCertificate(firstCertDER)
 	if err != nil {
@@ -140,13 +149,17 @@ func Connect(ctx context.Context, target string, port string) (*x509.Certificate
 }
 
 func findCertificateOffset(raw []byte) (offset int, size int, err error) {
-	for idx := 0; idx < len(raw); idx = idx + 1 {
+	for idx := 0; idx < len(raw); idx++ {
 		if raw[idx] == 0x0b {
+			// Safety Check: Проверяем, что есть место для чтения длины сообщения (3 байта)
+			if idx+4 > len(raw) {
+				return 0, 0, fmt.Errorf("incomplete certificate message header at index %d", idx)
+			}
 			msgLen := int(raw[idx+1])<<16 | int(raw[idx+2])<<8 | int(raw[idx+3])
 			return idx, msgLen, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("Not found")
+	return 0, 0, fmt.Errorf("not found")
 }
 
 func makeClientHello(hostname string) []byte {
@@ -207,23 +220,7 @@ func makeClientHello(hostname string) []byte {
 	return res
 }
 
-func parseGostCertificate(der []byte) (*TBSCertificate, error) {
-	var cert RawCertificate
-	_, err := asn1.Unmarshal(der, &cert)
-	if err != nil {
-		return nil, fmt.Errorf("Ошибка первичного парсинга: %v\n", err)
-	}
-
-	var tbs TBSCertificate
-	_, err = asn1.Unmarshal(cert.TBSCertificate.FullBytes, &tbs)
-	if err != nil {
-		return nil, fmt.Errorf("Ошибка парсинга TBS секции: %v\n", err)
-	}
-	return &tbs, nil
-}
-
 func readFullRecord(ctx context.Context, conn net.Conn) ([]byte, error) {
-	// Периодическая проверка контекста
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -232,7 +229,8 @@ func readFullRecord(ctx context.Context, conn net.Conn) ([]byte, error) {
 	header := make([]byte, 5)
 	_, err := io.ReadFull(conn, header)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read TLS header: %v", err)
+		// Было %v, меняем на %w для поддержки errors.Is/As и консистентности
+		return nil, fmt.Errorf("failed to read TLS header: %w", err)
 	}
 
 	// 2. Проверяем тип (должен быть Handshake 0x16 или Alert 0x15)
@@ -245,7 +243,7 @@ func readFullRecord(ctx context.Context, conn net.Conn) ([]byte, error) {
 
 	// 3. Узнаем длину тела из байтов [3:5]
 	recordLen := binary.BigEndian.Uint16(header[3:])
-	if recordLen > 16384 { // Защита от кривых данных
+	if recordLen > 16384 {
 		return nil, fmt.Errorf("record too large: %d", recordLen)
 	}
 
@@ -253,9 +251,8 @@ func readFullRecord(ctx context.Context, conn net.Conn) ([]byte, error) {
 	body := make([]byte, recordLen)
 	_, err = io.ReadFull(conn, body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read TLS body: %v", err)
+		return nil, fmt.Errorf("failed to read TLS body: %w", err)
 	}
 
-	// Возвращаем полный пакет (заголовок + тело)
 	return append(header, body...), nil
 }
