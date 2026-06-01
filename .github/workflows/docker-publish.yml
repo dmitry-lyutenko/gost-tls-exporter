@@ -11,7 +11,10 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # Добавляем это, чтобы убрать предупреждение и использовать Node.js 24
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: read
       packages: write
@@ -41,7 +44,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=ref,event=branch
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Исправлено: заменено main на master, чтобы тег latest создавался корректно
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
 
       - name: Determine Version
         id: versioning
