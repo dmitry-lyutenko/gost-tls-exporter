@@ -1,4 +1,11 @@
-.git
-.vscode
-todo.txt
-.continue
+*
+!Dockerfile
+!dockerignore
+!main.go
+!gost.go
+!metrics.go
+!go.mod
+!go.sum
+!.github/workflows
+!LICENSE
+!README.md
