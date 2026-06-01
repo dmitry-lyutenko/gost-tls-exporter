@@ -58,6 +58,11 @@ func main() {
 
 	metricsCache := &sync.Map{}
 
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+
 	http.HandleFunc("/probe", returnProbeHandler(metricsCache, cacheTTL))
 	http.Handle("/metrics", promhttp.Handler())
 
@@ -70,7 +75,11 @@ func main() {
 	term := make(chan os.Signal, 1)
 	signal.Notify(term, os.Interrupt, syscall.SIGTERM)
 
-	slog.Info("exporter started", "version", version, "address", *listenAddress, "port", *listenPort, "cache_ttl", cacheTTL.String())
+	if level == slog.LevelDebug {
+		slog.Debug("gost-tls-exporter started", "version", version, "address", *listenAddress, "port", *listenPort, "cache_ttl", cacheTTL.String())
+	} else {
+		slog.Info("gost-tls-exporter started", "version", version, "address", *listenAddress, "port", *listenPort, "cache_ttl", cacheTTL.String())
+	}
 	go func() {
 
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
